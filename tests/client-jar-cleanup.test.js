@@ -246,6 +246,33 @@ describe('client jar cleanup and listing with an isolated home', () => {
             expect(fs.readdirSync(microbotDir)).toEqual([]);
         });
 
+        test('remove-custom-client-jar deletes only custom jars', async () => {
+            touch('microbot-custom.jar');
+            touch('microbot-2.6.28.jar');
+
+            expect(await handlers['remove-custom-client-jar']({}, 'custom')).toEqual({
+                success: true,
+                version: 'custom',
+                file: 'microbot-custom.jar'
+            });
+            expect(exists('microbot-custom.jar')).toBe(false);
+            expect(exists('microbot-2.6.28.jar')).toBe(true);
+
+            expect(await handlers['remove-custom-client-jar']({}, '2.6.28')).toEqual({
+                error: 'Only custom client JARs can be removed.'
+            });
+            expect(exists('microbot-2.6.28.jar')).toBe(true);
+        });
+
+        test('remove-custom-client-jar rejects unsafe or missing versions', async () => {
+            expect(await handlers['remove-custom-client-jar']({}, '../evil')).toEqual({
+                error: 'Invalid client version: "../evil"'
+            });
+            expect(await handlers['remove-custom-client-jar']({}, 'missing')).toEqual({
+                error: 'Custom client JAR not found.'
+            });
+        });
+
         test('download-client records the version as launcher-managed', async () => {
             const sender = { send: jest.fn() };
 
@@ -266,15 +293,25 @@ describe('client jar cleanup and listing with an isolated home', () => {
                 });
                 expect(await handlers['client-exists']({}, version)).toBe(false);
                 expect((await handlers['open-client']({}, version, {}, {}, '1g')).error).toMatch(/^Invalid client version/);
-                expect((await handlers['play-no-jagex-account']({}, version, {}, '1g')).error).toMatch(/^Invalid client version/);
             }
             expect(axios).not.toHaveBeenCalled();
             expect(fs.existsSync(path.join(homeDir, 'escape.jar'))).toBe(false);
         });
 
+        test('open-client refuses to start without a Jagex account login', async () => {
+            touch('microbot-2.6.22.jar');
+
+            expect(await handlers['open-client']({ sender: { send: jest.fn() } }, '2.6.22', {}, { accountId: '1', profile: 'Main' }, '1g')).toEqual({
+                error: 'This Jagex account has no saved login. Click Add accounts and log in with Jagex again.'
+            });
+            expect(await handlers['open-client']({ sender: { send: jest.fn() } }, '2.6.22', {}, null, '1g')).toEqual({
+                error: 'This Jagex account has no saved login. Click Add accounts and log in with Jagex again.'
+            });
+        });
+
         test('keeps registering other jar-executor handlers unchanged', () => {
             expect(typeof handlers['open-client']).toBe('function');
-            expect(typeof handlers['play-no-jagex-account']).toBe('function');
+            expect(handlers['play-no-jagex-account']).toBeUndefined();
         });
 
         test('download-client does not claim a jar that already exists', async () => {

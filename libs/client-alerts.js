@@ -1,13 +1,15 @@
 const LINKS_PATH = '/api/alerts/client-links';
 const LIST_PATH = `${LINKS_PATH}?includeHidden=true`;
 const REQUEST_TIMEOUT_MS = 8000;
-const STATUS_TIMEOUT_MS = 3000;
 const LAUNCH_BUDGET_MS = 5000;
 const DEFAULT_LABEL = 'Microbot client';
 const DEFAULT_PROFILE = 'default';
 const TOKEN_PATTERN = /^mbc_[A-Za-z0-9_-]{43}$/;
 const MAX_LABEL_LENGTH = 60;
 const MAX_ACCOUNT_ID_LENGTH = 128;
+const LOADER_LABEL = 'RuneLite (Microbot Loader)';
+const LOADER_KEY = 'runelite';
+const LOADER_SLOT = { kind: 'loader', key: LOADER_KEY, profile: null, label: LOADER_LABEL };
 
 module.exports = function setupClientAlerts(deps) {
     const { ipcMain, log, fs, safeStorage, auth, linksFile, settingsFile, accountsFile } = deps;
@@ -91,17 +93,6 @@ module.exports = function setupClientAlerts(deps) {
         return state.accountsMigrated ? state : migrateAccounts(state);
     };
 
-    const readDisabled = () => settings().disabled;
-
-    const isEnabled = (profile) => !readDisabled().includes(profile);
-
-    const setEnabled = (profile, enabled) => {
-        const state = settings();
-        const disabled = state.disabled.filter((name) => name !== profile);
-        if (!enabled) disabled.push(profile);
-        writeSettings({ ...state, disabled });
-    };
-
     const accountOn = (state, accountId, profile) => {
         if (hasOwn(state.accounts, accountId)) return state.accounts[accountId];
         return state.accountsMigrated || !state.disabled.includes(profile);
@@ -115,36 +106,35 @@ module.exports = function setupClientAlerts(deps) {
         writeSettings(state);
     };
 
-    const slotEnabled = (slot) => (slot.kind === 'accounts' ? isAccountEnabled(slot.key, slot.profile) : isEnabled(slot.profile));
+    const slotEnabled = (slot) => slot.kind === 'loader' || isAccountEnabled(slot.key, slot.profile);
 
     const readStore = (email) => {
-        const empty = { profiles: {}, accounts: {}, revoke: [] };
+        const empty = { profiles: {}, accounts: {}, loader: {}, revoke: [] };
         try {
             if (!canPersist() || !fs.existsSync(linksFile)) return empty;
             const value = JSON.parse(safeStorage.decryptString(fs.readFileSync(linksFile)));
             if (value?.email !== email || !value?.profiles || typeof value.profiles !== 'object') return empty;
             const revoke = Array.isArray(value.revoke) ? value.revoke.filter((id) => typeof id === 'string') : [];
             const accounts = value.accounts && typeof value.accounts === 'object' && !Array.isArray(value.accounts) ? value.accounts : {};
-            return { profiles: value.profiles, accounts, revoke };
+            const loader = value.loader && typeof value.loader === 'object' && !Array.isArray(value.loader) ? value.loader : {};
+            return { profiles: value.profiles, accounts, loader, revoke };
         } catch (error) {
             log.warn(`Could not read alert links: ${error?.message || error}`);
             return empty;
         }
     };
 
-    const writeStore = (email, { profiles, accounts = {}, revoke }) => {
+    const writeStore = (email, { profiles, accounts = {}, loader = {}, revoke }) => {
         if (!canPersist()) return;
+        const value = { email, profiles, accounts, revoke };
+        if (Object.keys(loader).length) value.loader = loader;
         try {
-            fs.writeFileSync(linksFile, safeStorage.encryptString(JSON.stringify({ email, profiles, accounts, revoke })), { mode: 0o600 });
+            fs.writeFileSync(linksFile, safeStorage.encryptString(JSON.stringify(value)), { mode: 0o600 });
             fs.chmodSync(linksFile, 0o600);
         } catch (error) {
             log.warn(`Could not save alert links: ${error?.message || error}`);
         }
     };
-
-    const readLinks = (email) => readStore(email).profiles;
-
-    const writeLinks = (email, profiles) => writeStore(email, { ...readStore(email), profiles });
 
     const readEntry = (email, slot) => ownEntry(readStore(email)[slot.kind], slot.key);
 
@@ -252,7 +242,7 @@ module.exports = function setupClientAlerts(deps) {
         }
         if (stored && readEntry(email, slot)?.id === stored.id) writeEntry(email, slot, null);
         const created = await createLink(email, slot.label);
-        writeEntry(email, slot, slot.kind === 'accounts' ? { ...created, profile: slot.profile } : { ...created, noJagex: true });
+        writeEntry(email, slot, newEntry(slot, created));
         if (!slotEnabled(slot)) {
             log.info(`The dashboard switch for ${describe(slot)} was turned off while it was being linked; keeping the link for later.`);
             return null;
@@ -261,9 +251,22 @@ module.exports = function setupClientAlerts(deps) {
         return created.token;
     };
 
+    // Links made by clients started without an account can never start again, so revoke them.
+    const queueNoJagexLinks = (email) => {
+        const store = readStore(email);
+        const dead = Object.entries(store.profiles).filter(([, link]) => link?.noJagex);
+        if (!dead.length) return;
+        const profiles = { ...store.profiles };
+        dead.forEach(([profile]) => delete profiles[profile]);
+        const ids = dead.filter(([, link]) => link.id).map(([, link]) => String(link.id));
+        writeStore(email, { ...store, profiles, revoke: [...store.revoke.filter((id) => !ids.includes(id)), ...ids] });
+        log.info(`Removing ${dead.length} alert link(s) made by clients started without a Jagex account.`);
+    };
+
     const revokeQueued = async () => {
         const email = signedInEmail();
         if (!email || !auth || !canPersist()) return;
+        queueNoJagexLinks(email);
         for (const id of readStore(email).revoke) {
             try {
                 await auth.request({ method: 'delete', path: `${LINKS_PATH}/${encodeURIComponent(id)}`, timeout: REQUEST_TIMEOUT_MS });
@@ -283,52 +286,13 @@ module.exports = function setupClientAlerts(deps) {
         return revoking;
     };
 
-    const linkLabels = async (email, profiles) => {
-        const stored = email ? readLinks(email) : {};
-        const labels = {};
-        profiles.forEach((profile) => {
-            const cached = stored[profile]?.label;
-            labels[profile] = typeof cached === 'string' && cached ? cached : defaultLabel(profile);
-        });
-        const linked = profiles.filter((profile) => stored[profile]?.id);
-        if (!linked.length || !auth) return labels;
-        try {
-            const { data } = await auth.request({ method: 'get', path: LIST_PATH, timeout: STATUS_TIMEOUT_MS });
-            if (!Array.isArray(data)) return labels;
-            const byId = new Map(data.map((link) => [String(link?.id).toLowerCase(), link?.label]));
-            const changed = {};
-            linked.forEach((profile) => {
-                const id = String(stored[profile].id).toLowerCase();
-                if (!byId.has(id)) {
-                    labels[profile] = defaultLabel(profile);
-                    return;
-                }
-                const label = byId.get(id);
-                if (typeof label !== 'string' || !label) return;
-                labels[profile] = label;
-                if (label !== stored[profile].label) changed[profile] = label;
-            });
-            if (Object.keys(changed).length) {
-                const current = readLinks(email);
-                Object.entries(changed).forEach(([profile, label]) => {
-                    if (current[profile]?.id === stored[profile].id) current[profile] = { ...current[profile], label };
-                });
-                writeLinks(email, current);
-            }
-        } catch (error) {
-            log.warn(`Could not load alert link names: ${error?.message || error}`);
-        }
-        return labels;
-    };
-
     const tokenForLaunch = async (rawProfile, account) => {
         const profile = profileName(rawProfile);
         const email = signedInEmail();
         if (!email || !auth) return null;
-        const accountId = isAccountId(account?.accountId) ? account.accountId : null;
-        const slot = accountId
-            ? { kind: 'accounts', key: accountId, profile, label: accountLabel(account) }
-            : { kind: 'profiles', key: profile, profile, label: null };
+        // Clients only start with a Jagex account, so only accounts get an alert link.
+        if (!isAccountId(account?.accountId)) return null;
+        const slot = { kind: 'accounts', key: account.accountId, profile, label: accountLabel(account) };
         if (!slotEnabled(slot)) return null;
         if (!canPersist()) {
             log.info('Bot alerts need secure storage, which is not available; launching without alerts.');
@@ -355,7 +319,65 @@ module.exports = function setupClientAlerts(deps) {
         return withinBudget(pending.get(key), () => storedToken(email, slot));
     };
 
-    const tokenForProfile = (rawProfile) => tokenForLaunch(rawProfile, null);
+    const revokeUnsavedLoaderLinks = async () => {
+        let links;
+        try {
+            const { data } = await auth.request({ method: 'get', path: LIST_PATH, timeout: REQUEST_TIMEOUT_MS });
+            links = Array.isArray(data) ? data : [];
+        } catch (error) {
+            if (error?.response?.status === 401) throw error;
+            log.warn(`Could not list the client links to clear old RuneLite links: ${error?.message || error}`);
+            return;
+        }
+        for (const link of links.filter((entry) => entry?.id && entry.label === LOADER_LABEL)) {
+            try {
+                await auth.request({ method: 'delete', path: `${LINKS_PATH}/${encodeURIComponent(link.id)}`, timeout: REQUEST_TIMEOUT_MS });
+            } catch (error) {
+                if (error?.response?.status === 401) throw error;
+                if (error?.response?.status !== 404) log.warn(`Could not revoke an old RuneLite link: ${error?.message || error}`);
+            }
+        }
+    };
+
+    const replaceUnsavedLoaderLink = async (email) => {
+        log.info('Secure storage is not available, so the RuneLite link is not saved on this PC; replacing any earlier one.');
+        await revokeUnsavedLoaderLinks();
+        return (await createLink(email, LOADER_LABEL)).token;
+    };
+
+    const tokenForLoader = async () => {
+        const email = signedInEmail();
+        if (!email || !auth) throw signedOutError();
+        const persist = canPersist();
+        if (persist) retryRevokes();
+        const key = `${email}\n${LOADER_SLOT.kind}\n${LOADER_SLOT.key}`;
+        if (!pending.has(key)) {
+            const work = persist ? resolveToken(LOADER_SLOT, email) : replaceUnsavedLoaderLink(email);
+            pending.set(key, work.finally(() => pending.delete(key)));
+        }
+        const token = await pending.get(key);
+        if (!token) throw new Error('No client link was created for RuneLite');
+        return token;
+    };
+
+    const forgetLoaderToken = async () => {
+        const email = signedInEmail();
+        if (!email || !auth) return;
+        if (!canPersist()) {
+            await revokeUnsavedLoaderLinks();
+            log.info('Unlinked Microbot in RuneLite from the dashboard.');
+            return;
+        }
+        const store = readStore(email);
+        const entry = ownEntry(store.loader, LOADER_KEY);
+        if (!entry) return;
+        const loader = { ...store.loader };
+        delete loader[LOADER_KEY];
+        const revoke = entry.id ? [...store.revoke.filter((id) => id !== String(entry.id)), String(entry.id)] : store.revoke;
+        writeStore(email, { ...store, loader, revoke });
+        log.info('Unlinked Microbot in RuneLite from the dashboard.');
+        await retryRevokes();
+    };
 
     const storedToken = (email, slot) => {
         const stored = readEntry(email, slot);
@@ -372,32 +394,6 @@ module.exports = function setupClientAlerts(deps) {
         });
         return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
     };
-
-    ipcMain.handle('alerts:status', async (_event, names) => {
-        const email = signedInEmail();
-        const signedIn = Boolean(email);
-        const disabled = readDisabled();
-        const enabled = {};
-        const profiles = (Array.isArray(names) ? names : []).map(profileName);
-        profiles.forEach((profile) => {
-            enabled[profile] = !disabled.includes(profile);
-        });
-        const available = signedIn && canPersist();
-        if (available) retryRevokes();
-        const labels = await linkLabels(available ? email : null, profiles);
-        return { signedIn, available, enabled, labels };
-    });
-
-    ipcMain.handle('alerts:set-enabled', async (_event, name, enabled) => {
-        const profile = profileName(name);
-        try {
-            setEnabled(profile, Boolean(enabled));
-        } catch (error) {
-            log.warn(`Could not save alert settings: ${error?.message || error}`);
-            return { error: 'Could not save the alert setting.', enabled: isEnabled(profile) };
-        }
-        return { enabled: isEnabled(profile), label: defaultLabel(profile) };
-    });
 
     ipcMain.handle('alerts:accounts', async (_event, accountIds) => {
         const email = signedInEmail();
@@ -423,20 +419,18 @@ module.exports = function setupClientAlerts(deps) {
     const linkedProfiles = () => {
         const email = signedInEmail();
         if (!email || !canPersist()) return {};
-        const disabled = readDisabled();
+        // Only a Jagex account with its dashboard switch on can start a client for its profile.
+        const state = settings();
+        const enabled = new Set(
+            (readAccountProfiles() || [])
+                .filter((account) => accountOn(state, account.accountId, profileName(account.profile)))
+                .map((account) => profileName(account.profile))
+        );
         const linked = {};
-        Object.entries(readLinks(email)).forEach(([profile, link]) => {
-            if (link?.id && !disabled.includes(profile)) linked[profile] = String(link.id);
+        Object.entries(readStore(email).profiles).forEach(([profile, link]) => {
+            if (link?.id && !link.noJagex && enabled.has(profile)) linked[profile] = String(link.id);
         });
         return linked;
-    };
-
-    const profilesWithoutAccount = () => {
-        const email = signedInEmail();
-        if (!email || !canPersist()) return [];
-        return Object.entries(readLinks(email))
-            .filter(([, link]) => link?.id && link.noJagex === true)
-            .map(([profile]) => profile);
     };
 
     const linkedAccounts = (accounts) => {
@@ -452,7 +446,7 @@ module.exports = function setupClientAlerts(deps) {
         return linked;
     };
 
-    return { tokenForLaunch, tokenForProfile, retryRevokes, linkedProfiles, linkedAccounts, profilesWithoutAccount };
+    return { tokenForLaunch, tokenForLoader, forgetLoaderToken, retryRevokes, linkedProfiles, linkedAccounts };
 };
 
 function hasOwn(object, key) {
@@ -471,17 +465,22 @@ function isAccountId(value) {
     return typeof value === 'string' && value.length > 0 && value.length <= MAX_ACCOUNT_ID_LENGTH;
 }
 
+function signedOutError() {
+    return Object.assign(new Error('Not signed in'), { response: { status: 401 } });
+}
+
+function newEntry(slot, created) {
+    return slot.kind === 'loader' ? created : { ...created, profile: slot.profile };
+}
+
 function describe(slot) {
-    return slot.kind === 'accounts' ? `the Jagex account on profile "${slot.profile}"` : `profile "${slot.profile}"`;
+    if (slot.kind === 'loader') return 'Microbot in RuneLite';
+    return `the Jagex account on profile "${slot.profile}"`;
 }
 
 function accountLabel(account) {
     const name = typeof account?.displayName === 'string' ? account.displayName.replace(/[\u0000-\u001f\u007f]/g, '').trim() : '';
     return name ? name.slice(0, MAX_LABEL_LENGTH) : null;
-}
-
-function defaultLabel() {
-    return DEFAULT_LABEL;
 }
 
 function profileName(value) {

@@ -1,0 +1,252 @@
+const EventEmitter = require('events');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const setupSessionRecorder = require('../libs/session-recorder');
+const { parseInfo, parseStatus, STATUS_PREFIX } = require('../libs/session-recorder');
+
+class FakeIpcMain {
+    constructor() {
+        this.handlers = new Map();
+    }
+
+    handle(channel, handler) {
+        this.handlers.set(channel, handler);
+    }
+
+    invoke(channel, ...args) {
+        return this.handlers.get(channel)(null, ...args);
+    }
+}
+
+const JAR = Buffer.from('PK\u0003\u0004 session recorder 1.0.0');
+const JAR_SHA = crypto.createHash('sha256').update(JAR).digest('hex');
+const NEXT_JAR = Buffer.from('PK\u0003\u0004 session recorder 1.0.1');
+const NEXT_SHA = crypto.createHash('sha256').update(NEXT_JAR).digest('hex');
+const HALF_HOUR = 30 * 60 * 1000;
+const ready = (recording) => STATUS_PREFIX + JSON.stringify({ state: 'ready', message: 'On.', recording, unrecorded: 0 }) + '\n';
+const httpError = (status) => Object.assign(new Error(`HTTP ${status}`), { response: { status } });
+const flush = async () => {
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+};
+
+describe('session-recorder', () => {
+    let dir;
+    let log;
+    let info;
+    let served;
+    let settings;
+    let children;
+    let spawn;
+    let runelite;
+    let sent;
+
+    const setup = () => {
+        const ipcMain = new FakeIpcMain();
+        const webContents = { send: jest.fn((channel, view) => sent.push(view)) };
+        setupSessionRecorder({
+            ipcMain,
+            log,
+            fs,
+            spawn,
+            runelite,
+            directory: dir,
+            env: { HOME: '/home/p', DISPLAY: ':0', APPIMAGE: '/home/p/Microbot Launcher.AppImage', APPDIR: '/tmp/.mount_x', LD_LIBRARY_PATH: '/tmp/.mount_x/usr/lib' },
+            platform: 'linux',
+            auth: {
+                email: () => 'admin@example.com',
+                request: jest.fn(async (config) => {
+                    if (config.path === '/api/loader/recorder/info') {
+                        if (info instanceof Error) throw info;
+                        return { data: info };
+                    }
+                    if (config.path === '/api/loader/recorder') return { data: served };
+                    throw httpError(404);
+                })
+            },
+            getWindow: () => ({ isDestroyed: () => false, webContents })
+        });
+        return ipcMain;
+    };
+
+    const say = (child, text) => child.stdout.emit('data', Buffer.from(text));
+
+    beforeEach(() => {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-recorder-'));
+        log = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+        info = { version: '1.0.0', sha256: JAR_SHA, size: JAR.length, url: '/api/loader/recorder' };
+        served = JAR;
+        settings = {};
+        sent = [];
+        children = [];
+        runelite = {
+            readSetting: (key) => settings[key],
+            writeSetting: (key, value) => {
+                settings[key] = value;
+                return true;
+            },
+            javaForTools: jest.fn(async () => '/jdk/bin/java'),
+            installedAgentJar: jest.fn(async () => '/home/p/.microbot/loader/agent.jar')
+        };
+        spawn = jest.fn((command, args, options) => {
+            const child = new EventEmitter();
+            child.command = command;
+            child.args = args;
+            child.env = options.env;
+            child.stdout = new EventEmitter();
+            child.stderr = new EventEmitter();
+            child.written = [];
+            child.stdin = Object.assign(new EventEmitter(), { writable: true, write: jest.fn((text) => child.written.push(text)) });
+            children.push(child);
+            return child;
+        });
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    test('an account the API refuses never sees it and nothing starts', async () => {
+        info = httpError(403);
+        const ipc = setup();
+
+        expect(await ipc.invoke('session-recorder:state')).toEqual({ visible: false });
+        expect(await ipc.invoke('session-recorder:set-on', true)).toEqual({ visible: false });
+        await flush();
+
+        expect(settings.sessionRecorder).toBeUndefined();
+        expect(spawn).not.toHaveBeenCalled();
+    });
+
+    test('turning it on downloads the checked jar, starts it with Microbot and shows its status', async () => {
+        const ipc = setup();
+
+        const view = await ipc.invoke('session-recorder:set-on', true);
+        await flush();
+
+        expect(view).toMatchObject({ visible: true, on: true });
+        expect(settings.sessionRecorder).toBe(true);
+        expect(children).toHaveLength(1);
+        const jar = path.join(dir, 'session-recorder-1.0.0.jar');
+        expect(children[0].command).toBe('/jdk/bin/java');
+        expect(children[0].args).toEqual(['-jar', jar, '--agent', '/home/p/.microbot/loader/agent.jar']);
+        expect(children[0].env).toEqual({ HOME: '/home/p', DISPLAY: ':0' });
+        expect(fs.readFileSync(jar)).toEqual(JAR);
+
+        say(children[0], 'RuneLite log line\n' + STATUS_PREFIX + '{"state":"ready","message":"On. Press Open RuneLite to start a recorded RuneLite.","recording":0,"unrecorded":1}\n');
+
+        expect(sent.at(-1)).toEqual({ visible: true, on: true, running: true, updating: false, message: 'On. Press Open RuneLite to start a recorded RuneLite.' });
+        expect(await ipc.invoke('session-recorder:open')).toEqual({ ok: true, message: 'RuneLite is starting through the Session Recorder.' });
+        expect(children[0].written).toEqual(['open\n']);
+    });
+
+    test('opening before it is ready says so and sends nothing', async () => {
+        const ipc = setup();
+        await ipc.invoke('session-recorder:set-on', true);
+        await flush();
+
+        expect((await ipc.invoke('session-recorder:open')).ok).toBe(false);
+        expect(children[0].written).toEqual([]);
+    });
+
+    test('a damaged download is refused and nothing starts', async () => {
+        served = Buffer.from('PK\u0003\u0004 something else entirely');
+        const ipc = setup();
+
+        await ipc.invoke('session-recorder:set-on', true);
+        await flush();
+
+        expect(spawn).not.toHaveBeenCalled();
+        expect(sent.at(-1).message).toBe('The Session Recorder download was damaged. Try again in a minute.');
+    });
+
+    test('turning it off asks the recorder to stop', async () => {
+        const ipc = setup();
+        await ipc.invoke('session-recorder:set-on', true);
+        await flush();
+
+        const view = await ipc.invoke('session-recorder:set-on', false);
+
+        expect(view.on).toBe(false);
+        expect(children[0].written).toEqual(['stop\n']);
+    });
+
+    test('it starts on its own when it was left on', async () => {
+        settings.sessionRecorder = true;
+        const ipc = setup();
+
+        await ipc.invoke('session-recorder:state');
+        await flush();
+
+        expect(children).toHaveLength(1);
+    });
+
+    test('a crash shows a message and is not restarted in a loop', async () => {
+        const ipc = setup();
+        await ipc.invoke('session-recorder:set-on', true);
+        await flush();
+
+        children[0].emit('close', 1);
+        const view = await ipc.invoke('session-recorder:state');
+        await flush();
+
+        expect(view.message).toBe('The Session Recorder stopped. Turn it off and on to start it again.');
+        expect(children).toHaveLength(1);
+    });
+
+    test('a newer version replaces an idle recorder on its own', async () => {
+        jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+        const ipc = setup();
+        await ipc.invoke('session-recorder:set-on', true);
+        await flush();
+        say(children[0], ready(0));
+
+        info = { version: '1.0.1', sha256: NEXT_SHA, size: NEXT_JAR.length, url: '/api/loader/recorder' };
+        served = NEXT_JAR;
+        jest.advanceTimersByTime(HALF_HOUR);
+        await flush();
+
+        expect(children[0].written).toEqual(['stop\n']);
+        expect(sent.at(-1)).toMatchObject({ running: false, updating: true, message: 'Updating the Session Recorder...' });
+        expect((await ipc.invoke('session-recorder:open')).ok).toBe(false);
+
+        info = httpError(503);
+        say(children[0], STATUS_PREFIX + '{"state":"stopped","message":"The Session Recorder is off.","recording":0,"unrecorded":0}\n');
+        children[0].emit('close', 0);
+        await flush();
+
+        expect(children).toHaveLength(2);
+        expect(children[1].args[1]).toBe(path.join(dir, 'session-recorder-1.0.1.jar'));
+        expect(fs.existsSync(path.join(dir, 'session-recorder-1.0.0.jar'))).toBe(false);
+    });
+
+    test('it never updates while recording or right after Open RuneLite', async () => {
+        jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+        const ipc = setup();
+        await ipc.invoke('session-recorder:set-on', true);
+        await flush();
+        info = { version: '1.0.1', sha256: NEXT_SHA, size: NEXT_JAR.length, url: '/api/loader/recorder' };
+        served = NEXT_JAR;
+
+        say(children[0], ready(1));
+        jest.advanceTimersByTime(HALF_HOUR);
+        await flush();
+        expect(children[0].written).toEqual([]);
+
+        say(children[0], ready(0));
+        jest.advanceTimersByTime(25 * 60 * 1000);
+        await ipc.invoke('session-recorder:open');
+        jest.advanceTimersByTime(5 * 60 * 1000);
+        await flush();
+        expect(children[0].written).toEqual(['open\n']);
+    });
+
+    test('parsing refuses odd answers', () => {
+        expect(parseInfo({ ...{ version: '1.0.0', sha256: JAR_SHA, size: 10, url: 'https://evil.example/x' } })).toBeNull();
+        expect(parseInfo({ version: '../1', sha256: JAR_SHA, size: 10, url: '/api/loader/recorder' })).toBeNull();
+        expect(parseStatus('not json')).toBeNull();
+        expect(parseStatus('{"state":"ready","message":"' + 'x'.repeat(400) + '"}').message).toHaveLength(300);
+    });
+});

@@ -15,21 +15,17 @@ module.exports = async function (deps) {
     const url = 'https:/microbot.cloud';
     const filestorage = 'https://files.microbot.cloud';
 
-    const { startAuthFlow, cancelAuthFlow } = require(path.join(
+    const { startAuthFlow, cancelAuthFlow, authFlowRunning } = require(path.join(
         projectDir,
         'libs',
         'oauth-jagex.js'
-    ));
-    const { toProxyUri, startLoginProxy } = require(path.join(
-        projectDir,
-        'libs',
-        'login-proxy.js'
     ));
     const {
         listClientJars,
         markClientDownloaded,
         isSafeClientVersion,
-        customClientVersion
+        customClientVersion,
+        parseClientJar
     } = require(path.join(projectDir, 'libs', 'client-jars.js'));
     const { ensureHwidAgentJar } = require(path.join(projectDir, 'libs', 'hwid-agent.js'));
     const { prepareNightly, nightlyStatus, isCompleteJar } = require(path.join(
@@ -53,6 +49,7 @@ module.exports = async function (deps) {
             win.show();
             win.focus();
         };
+        if (authFlowRunning?.()) return { error: 'A Jagex login is already open in your browser.' };
         try {
             const result = await startAuthFlow({ proxy });
             bringLauncherToFront();
@@ -80,9 +77,12 @@ module.exports = async function (deps) {
         'libs',
         'overwrite-credential-properties.js'
     ));
-    const launchQueue = require(path.join(projectDir, 'libs', 'launch-queue.js'))();
+    const launchQueue = deps.launchQueue || require(path.join(projectDir, 'libs', 'launch-queue.js'))();
     const writeCredentials = (account) =>
-        overwriteCredentialsHandler.writeCredentialProperties({ fs, path, homeDir: require('os').homedir() }, account);
+        overwriteCredentialsHandler.writeCredentialProperties(
+            { fs, path, homeDir: require('os').homedir(), settingsFile: path.join(microbotDir, 'launcher-settings.json'), log },
+            account
+        );
     await overwriteCredentialsHandler({ ...deps, launchQueue });
     const accountLoaderHandler = require(path.join(
         projectDir,
@@ -95,7 +95,7 @@ module.exports = async function (deps) {
         'libs',
         'jar-executor.js'
     ));
-    const versionCheckedChannels = new Set(['open-client', 'play-no-jagex-account']);
+    const versionCheckedChannels = new Set(['open-client']);
     const versionCheckedIpcMain = new Proxy(ipcMain, {
         get(target, prop) {
             if (prop === 'handle') {
@@ -117,22 +117,9 @@ module.exports = async function (deps) {
     const jarExecutor = await jarExecutorHandler({ ...deps, ipcMain: versionCheckedIpcMain, launchQueue, writeCredentials });
     const packageVersion = packageJson.version;
 
-    async function refreshSession(writeAccountsToFile, sessionId, proxyIp) {
-        const proxyUri = toProxyUri(proxyIp);
-        if (!proxyUri) return writeAccountsToFile(sessionId);
-        let loginProxy;
-        try {
-            loginProxy = await startLoginProxy(proxyUri);
-        } catch (error) {
-            log.error(`Could not start the proxy for a Jagex session: ${error.message}`);
-            return { ok: false, error: error.message };
-        }
-        try {
-            return await writeAccountsToFile(sessionId, loginProxy.httpOptions);
-        } finally {
-            await loginProxy.close();
-        }
-    }
+    const jagexSession = require(path.join(projectDir, 'libs', 'jagex-session.js'));
+    const refreshSession = (writeAccountsToFile, sessionId, proxyIp) =>
+        jagexSession.refreshSession({ writeAccountsToFile, log }, sessionId, proxyIp);
 
     ipcMain.handle('refresh-accounts', async (event, proxy) => {
         try {
@@ -430,6 +417,39 @@ module.exports = async function (deps) {
         }
     });
 
+    ipcMain.handle('remove-custom-client-jar', async (event, version) => {
+        if (!isSafeClientVersion(version)) {
+            return invalidVersionResult(version);
+        }
+        const entry = parseClientJar(`microbot-${version}.jar`);
+        if (!entry || entry.kind !== 'custom') {
+            return { error: 'Only custom client JARs can be removed.' };
+        }
+        const filePath = path.join(microbotDir, entry.file);
+        try {
+            if (!fs.statSync(filePath).isFile()) {
+                return { error: 'Custom client JAR not found.' };
+            }
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return { error: 'Custom client JAR not found.' };
+            }
+            log.error(`Could not inspect custom client ${filePath}: ${error.message}`);
+            return { error: error.message };
+        }
+        try {
+            fs.rmSync(filePath);
+            log.info(`Removed custom client ${entry.file}`);
+            return { success: true, version, file: entry.file };
+        } catch (error) {
+            if (['EBUSY', 'EPERM', 'EACCES'].includes(error.code)) {
+                return { error: 'Close any client using this custom JAR, then try again.' };
+            }
+            log.error(`Could not remove custom client ${filePath}: ${error.message}`);
+            return { error: error.message };
+        }
+    });
+
     /*
      * Read the profiles from the %USERPROFILE%/.runelite/profiles.json
      * and filter out profiles with negative ID, returning the name strings
@@ -464,26 +484,6 @@ module.exports = async function (deps) {
     }
 
     ipcMain.handle('list-profiles', async () => readProfileNames((message) => log.error(message)));
-
-    ipcMain.handle('read-non-jagex-profile', async () => {
-        const profileFilePath = path.join(
-            microbotDir,
-            'non-jagex-preferred-profile.json'
-        );
-        if (fs.existsSync(profileFilePath)) {
-            try {
-                const data = fs.readFileSync(profileFilePath, 'utf8');
-                const profile = JSON.parse(data);
-                return profile?.profile;
-            } catch (error) {
-                log.error(`Error reading non-Jagex profile file: ${error}`);
-                return { error: error.message };
-            }
-        } else {
-            log.error('Non-Jagex profile file does not exist');
-            return { error: 'Non-Jagex profile file does not exist' };
-        }
-    });
 
     ipcMain.handle('launcher-version', async () => {
         return packageVersion;

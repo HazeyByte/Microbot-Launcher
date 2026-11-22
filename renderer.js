@@ -750,6 +750,7 @@ async function runJagexLogin(button) {
     button.title = 'Finish logging in to Jagex in your browser, or click to cancel.';
     try {
         const authResult = await window.electron.startAuthFlow(getProxyValues());
+        window.refreshRuneliteCharacters?.();
         if (authResult?.error) {
             window.electron.errorAlert(authResult.error);
         }
@@ -810,6 +811,7 @@ async function handleJagexAccountLogic(properties) {
     setInterval(async () => {
         const hasChanged = await window.electron.checkFileChange();
         if (hasChanged) {
+            window.refreshRuneliteCharacters?.();
             const oldNumberOfAccounts = accounts.length;
             const latestAccounts = await safeReadAccounts();
             if (!latestAccounts) {
@@ -938,23 +940,16 @@ async function initializeLauncher() {
         window.electron.logError(result.error);
     }
 
-    /*
-     * Whenever the profile select changes, we set the "preferred" profile on accounts.json
-     * for the current selected account, if no jagex account is selected, we set on
-     * the non-jagex-preferred-profile.json
-     */
+    // A profile choice is saved on the selected Jagex account in accounts.json
     document
         .getElementById('profile')
         .addEventListener('change', async (event) => {
-            const selectedProfile = event.target.value;
             const selectedAccount = document.getElementById('character')?.value;
             if (selectedAccount && selectedAccount !== 'none') {
                 await window.electron.setProfileJagexAccount(
                     selectedAccount,
-                    selectedProfile
+                    event.target.value
                 );
-            } else {
-                await window.electron.setProfileNoJagexAccount(selectedProfile);
             }
         });
 
@@ -983,12 +978,7 @@ async function initializeLauncher() {
                     await applyAccountProxy(account);
                 }
             } else {
-                // If no account is selected, set the profile to the preferred non-Jagex account profile
-                // If no profile is set, default to "default"
-                const nonJagexProfile =
-                    await window.electron.readNonJagexProfile();
-                const profile = nonJagexProfile || 'default';
-                document.getElementById('profile').value = profile;
+                document.getElementById('profile').value = 'default';
             }
             refreshAccountDashboardSwitch();
             if (!restoringSelectedAccount) {
@@ -1087,11 +1077,13 @@ function populateAccountSelector(characters = [], selectedAccount = null) {
     // Clear any existing options (optional)
     characterSelect.innerHTML = '';
 
-    // Create a default "none" option
-    const defaultOption = document.createElement('option');
-    defaultOption.value = 'none';
-    defaultOption.textContent = 'None';
-    characterSelect.appendChild(defaultOption);
+    // Placeholder only while no Jagex account is added; clients can't start without one.
+    if (characters.length === 0) {
+        const defaultOption = document.createElement('option');
+        defaultOption.value = 'none';
+        defaultOption.textContent = 'None';
+        characterSelect.appendChild(defaultOption);
+    }
 
     // Iterate over the characters array and create option elements
     characters.forEach((character) => {
@@ -1161,8 +1153,8 @@ function renderAccountsList() {
     const updateToggleLabel = (value) => {
         if (value === 'none') {
             toggleLabel.textContent = 'None';
-            toggleButton.setAttribute('aria-label', 'No Jagex account selected');
-            toggleButton.title = 'No Jagex account selected';
+            toggleButton.setAttribute('aria-label', 'No Jagex account selected. Pick one to play.');
+            toggleButton.title = 'No Jagex account selected. Pick one to play.';
             return;
         }
 
@@ -1222,30 +1214,6 @@ function renderAccountsList() {
         toggleButton.focus();
     };
 
-    const createNoneOption = () => {
-        const optionRow = document.createElement('div');
-        optionRow.className = 'account-option';
-        optionRow.setAttribute('role', 'option');
-        if (currentSelectedValue === 'none') {
-            optionRow.classList.add('selected');
-            optionRow.setAttribute('aria-selected', 'true');
-        } else {
-            optionRow.setAttribute('aria-selected', 'false');
-        }
-
-        const nameButton = document.createElement('button');
-        nameButton.type = 'button';
-        nameButton.className = 'account-option-name';
-        nameButton.textContent = 'None';
-        nameButton.title = 'Use no Jagex account';
-        nameButton.addEventListener('click', () => {
-            setSelectedAccount('none');
-        });
-
-        optionRow.appendChild(nameButton);
-        return optionRow;
-    };
-
     const createAccountOption = (account) => {
         const optionRow = document.createElement('div');
         optionRow.className = 'account-option';
@@ -1292,15 +1260,6 @@ function renderAccountsList() {
         optionsList.innerHTML = '';
         const normalizedFilter = filterText.trim().toLowerCase();
         let visibleCount = 0;
-
-        const shouldShowNone =
-            normalizedFilter.length === 0 ||
-            'none'.includes(normalizedFilter);
-
-        if (shouldShowNone) {
-            optionsList.appendChild(createNoneOption());
-            visibleCount += 1;
-        }
 
         accounts.forEach((account) => {
             const displayName = getAccountLabel(account).toLowerCase();
@@ -1420,6 +1379,7 @@ async function handleAccountDelete(accountId) {
     }
 
     const result = await window.electron.deleteAccount(accountId);
+    window.refreshRuneliteCharacters?.();
     if (result?.error) {
         window.electron.errorAlert(
             `Failed to delete account: ${result.error}`
@@ -1447,6 +1407,7 @@ async function removeAccountsHandler() {
 
     // Remove accounts via the Electron API
     await window.electron.removeAccounts();
+    window.refreshRuneliteCharacters?.();
 
     // Update the global accounts array
     accounts = [];
@@ -1454,7 +1415,7 @@ async function removeAccountsHandler() {
     // Reset UI to show no accounts state
     await setupSidebarLayout(0);
 
-    // Update the profile to non-Jagex profile or default
+    // Update the profile to default
     await updateProfileBasedOnCharacter();
 
     // Update the play button text
@@ -1472,6 +1433,7 @@ async function setupSidebarLayout(amountOfAccounts) {
     const playJagexButton = document.getElementById('play');
     const logoutButton = document.getElementById('logout');
     const addAccountsButton = document.getElementById('add-accounts');
+    const oldLoginHelp = document.getElementById('old-login-help');
     const characterSelectLabel = document.querySelector(
         'label[for="character"]'
     );
@@ -1489,6 +1451,7 @@ async function setupSidebarLayout(amountOfAccounts) {
             accountsDropdownContainer.style.display = 'block';
         }
         addAccountsButton.style.display = 'block';
+        if (oldLoginHelp) oldLoginHelp.style.display = 'none';
         populateAccountSelector(accounts, selectedAccount);
         const accountStillExists = accounts.some(
             (acc) => acc.accountId === selectedAccount
@@ -1517,11 +1480,13 @@ async function setupSidebarLayout(amountOfAccounts) {
             accountsDropdownContainer.style.display = 'none';
         }
         addAccountsButton.style.display = 'none';
+        // With no accounts added, point people still on a pre-Jagex login to the upgrade steps.
+        if (oldLoginHelp) oldLoginHelp.style.display = 'block';
 
         // Clear character selector and make sure 'none' is selected
         populateAccountSelector([], 'none');
 
-        // Also update the profile to use non-Jagex profile or default
+        // Also reset the profile to default
         updateProfileBasedOnCharacter();
     }
 
@@ -1545,6 +1510,7 @@ function setupRefreshAccountsButton() {
         refreshBtn.disabled = true;
         try {
             const result = await window.electron.refreshAccounts(getProxyValues());
+            window.refreshRuneliteCharacters?.();
             if (result?.error) {
                 window.electron.errorAlert(result.error);
                 return;
@@ -1594,45 +1560,6 @@ function extractVersion(versionString) {
     return s.replace(/^microbot-/, '').replace(/\.jar$/, '');
 }
 
-/**
- * Setup play button for launching without Jagex account
- *
- * First checks for the attempt of launching an outdated version of the client.
- * If for some reason the client selected doesn't exist, it will trigger a download.
- */
-function playNoJagexAccount() {
-    const playNoJagexButton = document.getElementById('play-no-jagex-account');
-    playNoJagexButton?.removeEventListener('click', playButtonClickHandler);
-    playNoJagexButton?.addEventListener('click', async () => {
-        await checkForOutdatedLaunch();
-
-        const proxy = getProxyValues();
-        const ramPreference = getClientRamPreference();
-        const hwidSpoof = getHwidSpoofPreference();
-
-        const selectedProfile =
-            document.getElementById('profile').value || 'default';
-        await window.electron.setProfileNoJagexAccount(selectedProfile);
-        const version = await resolveLaunchVersion();
-        if (version) {
-            try {
-                await recordClientUse(version);
-                const playResult = await window.electron.playNoJagexAccount(
-                    version,
-                    proxy,
-                    ramPreference,
-                    hwidSpoof
-                );
-                if (playResult?.error) {
-                    window.electron.errorAlert(playResult.error);
-                }
-            } catch (err) {
-                window.electron.errorAlert(err?.message || String(err));
-            }
-        }
-    });
-}
-
 async function resolveLaunchVersion() {
     if (channelSwitching) return null;
     if (isNightlyChannel()) {
@@ -1679,12 +1606,10 @@ function renderChannel() {
         button.setAttribute('aria-pressed', button.dataset.channel === clientChannel ? 'true' : 'false');
         button.disabled = channelSwitching;
     });
-    ['play', 'play-no-jagex-account'].forEach((id) => {
-        const button = document.getElementById(id);
-        if (button) button.disabled = channelSwitching;
-    });
-    const clientSelect = document.getElementById('client');
-    if (clientSelect) clientSelect.hidden = isNightlyChannel();
+    const playButton = document.getElementById('play');
+    if (playButton) playButton.disabled = channelSwitching;
+    const clientRow = document.getElementById('client-row');
+    if (clientRow) clientRow.hidden = isNightlyChannel();
     const nightlyInfo = document.getElementById('nightly-info');
     if (nightlyInfo) nightlyInfo.hidden = !isNightlyChannel();
 }
@@ -1926,6 +1851,189 @@ function setupCustomClientJar() {
     button?.addEventListener('click', loadCustomClientJar);
 }
 
+function renderCustomClientList(jars) {
+    const list = document.getElementById('custom-clients-list');
+    const empty = document.getElementById('custom-clients-empty');
+    if (!list) return;
+    const customJars = Array.isArray(jars)
+        ? jars.filter((jar) => jar.kind === 'custom')
+        : [];
+    list.innerHTML = '';
+    if (empty) empty.hidden = customJars.length > 0;
+    for (const jar of customJars) {
+        const row = document.createElement('li');
+        row.className = 'custom-client-row';
+        const details = document.createElement('div');
+        details.className = 'custom-client-details';
+        const name = document.createElement('span');
+        name.className = 'custom-client-name';
+        name.textContent = jar.label;
+        const file = document.createElement('span');
+        file.className = 'custom-client-file';
+        file.textContent = jar.file;
+        details.append(name, file);
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className =
+            'profile-icon-button profile-delete-button custom-client-remove';
+        remove.dataset.version = jar.version;
+        remove.title = `Remove ${jar.file}`;
+        remove.setAttribute('aria-label', `Remove ${jar.file}`);
+        remove.innerHTML =
+            '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"></path></svg>';
+        row.append(details, remove);
+        list.appendChild(row);
+    }
+}
+
+async function refreshClientJarListAfterRemoval() {
+    const selectedFile = document.getElementById('client').value;
+    const remaining = await orderClientJarsByVersion();
+    populateSelectElement('client', remaining);
+    const keep = remaining.find((jar) => jar.file === selectedFile);
+    if (keep) {
+        await selectClientVersion(keep.version);
+        return;
+    }
+    if (remaining.length > 0) {
+        await selectClientVersion(remaining[0].version);
+        return;
+    }
+    const properties = await window.electron.readProperties();
+    properties['version_pref'] = '0.0.0';
+    await window.electron.writeProperties(properties);
+}
+
+function setupCustomClientManager() {
+    const modal = document.getElementById('custom-clients-modal');
+    const openButton = document.getElementById('manage-custom-clients');
+    const closeButton = document.getElementById('custom-clients-close');
+    const list = document.getElementById('custom-clients-list');
+    const message = document.getElementById('custom-clients-error');
+    if (!modal || !openButton || !list) return;
+
+    const close = () => {
+        modal.classList.add('auth-hidden');
+        document.removeEventListener('keydown', closeOnEscape);
+        openButton.focus();
+    };
+    const closeOnEscape = (event) => {
+        if (event.key === 'Escape') close();
+    };
+    const showMessage = (text) => {
+        if (!message) return;
+        message.textContent = text;
+        message.classList.remove('success');
+    };
+
+    openButton.addEventListener('click', async () => {
+        showMessage('');
+        renderCustomClientList(await orderClientJarsByVersion());
+        modal.classList.remove('auth-hidden');
+        document.addEventListener('keydown', closeOnEscape);
+        closeButton?.focus();
+    });
+    closeButton?.addEventListener('click', close);
+    modal.addEventListener('click', (event) => {
+        if (event.target === modal) close();
+    });
+    list.addEventListener('click', async (event) => {
+        const button = event.target.closest('.custom-client-remove');
+        if (!button || button.disabled) return;
+        const version = button.dataset.version;
+        const jars = await orderClientJarsByVersion();
+        const jar = jars.find(
+            (entry) => entry.version === version && entry.kind === 'custom'
+        );
+        if (!jar) {
+            showMessage('That custom client is no longer in the list.');
+            return;
+        }
+        const confirmed = await window.electron.showConfirmationDialog(
+            'Remove this custom client?',
+            `This deletes ${jar.file} from your .microbot folder. This cannot be undone.`,
+            'Remove custom client',
+            'Remove',
+            'Cancel',
+            { type: 'warning', defaultId: 1, cancelId: 1 }
+        );
+        if (!confirmed) return;
+        button.disabled = true;
+        try {
+            const result = await window.electron.removeCustomClientJar(version);
+            if (result?.error) {
+                showMessage(result.error);
+                return;
+            }
+            await refreshClientJarListAfterRemoval();
+            renderCustomClientList(await orderClientJarsByVersion());
+            showMessage(`Removed ${jar.file}.`);
+            if (message) message.classList.add('success');
+        } catch (error) {
+            showMessage(error?.message || String(error));
+        } finally {
+            button.disabled = false;
+        }
+    });
+}
+
+let refreshingClientJars = false;
+
+/**
+ * Rescan the .microbot folder and rebuild the version list. Keeps the current
+ * pick; on a click, if exactly one new jar showed up, selects it instead.
+ *
+ * @param {boolean} quiet Window-focus rescan: no rebuild when nothing changed,
+ *     no switching to new jars, no error dialogs.
+ */
+async function refreshClientJars(quiet = false) {
+    const clientSelect = document.getElementById('client');
+    const button = document.getElementById('refresh-clients');
+    if (!clientSelect || refreshingClientJars || channelSwitching) return;
+    refreshingClientJars = true;
+    if (button) button.disabled = true;
+    try {
+        const before = [...clientSelect.options].map((o) => o.value);
+        const jars = await orderClientJarsByVersion();
+        const after = jars.map((jar) => jar.file);
+        if (quiet && before.join('\n') === after.join('\n')) return;
+
+        const previous = clientSelect.value;
+        const added = after.filter((file) => !before.includes(file));
+        populateSelectElement('client', jars);
+        // Only a click may switch to a new jar; focus rescans also see jars that remote/profile starts download.
+        const pick =
+            !quiet && added.length === 1 ? added[0] : after.includes(previous) ? previous : after[0];
+        if (pick) {
+            clientSelect.value = pick;
+            if (pick !== previous) {
+                await updateVersionPreference({ target: { value: pick } });
+            }
+        }
+    } catch (error) {
+        if (!quiet) window.electron.errorAlert(error?.message || String(error));
+    } finally {
+        refreshingClientJars = false;
+        if (button) button.disabled = false;
+    }
+}
+
+function setupClientJarRefresh() {
+    const button = document.getElementById('refresh-clients');
+    button?.removeEventListener('click', onRefreshClientsClick);
+    button?.addEventListener('click', onRefreshClientsClick);
+    window.removeEventListener('focus', onWindowFocusRefreshClients);
+    window.addEventListener('focus', onWindowFocusRefreshClients);
+}
+
+function onRefreshClientsClick() {
+    return refreshClientJars(false);
+}
+
+function onWindowFocusRefreshClients() {
+    return refreshClientJars(true);
+}
+
 /**
  * Select client version select element value
  *
@@ -2061,14 +2169,7 @@ async function updateProfileBasedOnCharacter() {
             profileSelect.value = 'default';
         }
     } else {
-        // If no account is selected or no accounts exist, use the non-Jagex preferred profile
-        const nonJagexProfile = await window.electron.readNonJagexProfile();
-        if (nonJagexProfile) {
-            profileSelect.value = nonJagexProfile;
-        } else {
-            // If no non-Jagex profile preference exists, use default
-            profileSelect.value = 'default';
-        }
+        profileSelect.value = 'default';
     }
 }
 
@@ -2135,8 +2236,7 @@ async function initUI(properties) {
     titlebarButtons();
     setupHamburgerMenu();
 
-    // Setup play button for non-Jagex accounts
-    playNoJagexAccount();
+    document.getElementById('old-login-help')?.addEventListener('click', () => window.openSetupGuide?.('Old login'));
 
     // Setup play button for Jagex accounts
     const playJagexButton = document.getElementById('play');
@@ -2161,6 +2261,8 @@ async function initUI(properties) {
     await setVersionPreference(properties);
     setupChannelSwitch(properties);
     setupCustomClientJar();
+    setupCustomClientManager();
+    setupClientJarRefresh();
     document.querySelector('.game-info').style = 'display:block';
 
     await setupRamInput();

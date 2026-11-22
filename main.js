@@ -64,7 +64,8 @@ async function loadLibraries() {
             projectDir: __dirname,
             fs: fs,
             app: app,
-            mainWindow: mainWindow
+            mainWindow: mainWindow,
+            launchQueue: require(path.join(__dirname, 'libs', 'launch-queue.js'))()
         };
         let apiAuth = null;
         try {
@@ -121,6 +122,39 @@ async function loadLibraries() {
             });
         } catch (alertsError) {
             log.error('Error setting up bot alerts:', alertsError);
+        }
+        if (apiAuth) {
+            try {
+                const loaderHome = path.join(require('os').homedir(), '.microbot', 'loader');
+                const runelite = require(path.join(__dirname, 'libs', 'runelite-loader.js'))({
+                    ipcMain,
+                    log,
+                    fs,
+                    spawn,
+                    axios,
+                    auth: apiAuth,
+                    alerts: deps.alerts,
+                    microbotDir,
+                    downloadsDir: path.join(loaderHome, 'downloads'),
+                    agentJar: path.join(loaderHome, 'agent.jar'),
+                    settingsFile: path.join(microbotDir, 'launcher-settings.json'),
+                    launchQueue: deps.launchQueue,
+                    dialog,
+                    getWindow: () => mainWindow
+                });
+                require(path.join(__dirname, 'libs', 'session-recorder.js'))({
+                    ipcMain,
+                    log,
+                    fs,
+                    spawn,
+                    auth: apiAuth,
+                    runelite,
+                    directory: loaderHome,
+                    getWindow: () => mainWindow
+                });
+            } catch (loaderError) {
+                log.error('Error setting up Microbot in RuneLite:', loaderError);
+            }
         }
         if (typeof handler === 'function') {
             const launcher = await handler(deps);
@@ -186,6 +220,8 @@ async function createWindow() {
         mainWindow.setWindowButtonVisibility(false);
     }
 
+    require(path.join(__dirname, 'libs', 'theme-settings.js')).register(ipcMain, log);
+
     try {
         const extraHandlers = require(path.join(
             __dirname,
@@ -228,6 +264,17 @@ app.on('web-contents-created', (_event, contents) => {
         if (/^https?:\/\//i.test(url)) shell.openExternal(url);
         return { action: 'deny' };
     });
+    // Under reduced motion the site skips its 3D hero, which redraws every frame on the GPU the clients share.
+    try {
+        contents.debugger.attach();
+        contents.debugger
+            .sendCommand('Emulation.setEmulatedMedia', {
+                features: [{ name: 'prefers-reduced-motion', value: 'reduce' }]
+            })
+            .catch((error) => log.warn(`Could not set reduced motion for the embedded site: ${error.message}`));
+    } catch (error) {
+        log.warn(`Could not set reduced motion for the embedded site: ${error.message}`);
+    }
 });
 
 app.whenReady().then(async () => {
